@@ -1,0 +1,16 @@
+{
+  "name": "car-tracker",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "build:api": "npm run build -w apps/api",
+    "build:web": "npm run build -w apps/web",
+    "db:push": "npm run db:push -w packages/database",
+    "db:migrate": "npm run migrate -w packages/database"
+  }
+}
