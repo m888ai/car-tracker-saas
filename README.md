@@ -2,71 +2,92 @@
 
 Track car services, maintenance, and value across all your vehicles.
 
-## Architecture (All Google Cloud)
+## Architecture (100% Google Cloud)
 
-| Layer | Service |
-|-------|---------|
-| **Web** | Next.js → Firebase Hosting / Cloud Run |
-| **Mobile** | Expo / React Native |
-| **API** | Cloud Run (Node.js + Express) |
-| **Database** | Cloud SQL (PostgreSQL) |
-| **Auth** | Firebase Auth |
-| **Payments** | Stripe (future) |
+| Layer | Service | Cost |
+|-------|---------|------|
+| **Web** | Next.js → Firebase Hosting | Free |
+| **Mobile** | Expo / React Native | Free |
+| **API** | Cloud Run (Node.js) | Free tier |
+| **Database** | Firestore | Free tier |
+| **Auth** | Firebase Auth | Free tier |
+| **Payments** | Stripe | Pay as you go |
+
+**Estimated cost: $0/mo** until significant scale (50K+ users)
 
 ## Structure
 ```
 car-tracker/
 ├── apps/
-│   ├── api/          # Cloud Run API (Express + Prisma)
+│   ├── api/          # Cloud Run API (Express)
 │   ├── web/          # Next.js web dashboard
 │   └── mobile/       # Expo mobile app
-├── packages/
-│   ├── database/     # Prisma schema + client
-│   └── shared/       # Shared types & utils
-└── infrastructure/   # Terraform/deployment
+└── packages/
+    └── shared/       # Shared TypeScript types
 ```
 
 ## Quick Start
 
-### 1. Install Dependencies
+### 1. Create Firebase Project
 ```bash
-npm install
+# Go to https://console.firebase.google.com
+# Create project: "car-tracker"
+# Enable: Authentication (Email/Password) + Firestore
 ```
 
-### 2. Set up Database
-```bash
-# Create Cloud SQL instance (or use local Postgres)
-# Then push schema:
-cd packages/database
-cp .env.example .env  # Add DATABASE_URL
-npx prisma db push
+### 2. Get Firebase Config
+- Project Settings → Your Apps → Add Web App
+- Copy config values
+
+### 3. Set Environment Variables
+
+**API** (`apps/api/.env`):
+```
+FIREBASE_PROJECT_ID=your-project-id
+GOOGLE_APPLICATION_CREDENTIALS=path/to/service-account.json
 ```
 
-### 3. Set up Firebase
-1. Create project at https://console.firebase.google.com
-2. Enable Authentication → Email/Password
-3. Add Web App, copy config to `.env` files
+**Web** (`apps/web/.env.local`):
+```
+NEXT_PUBLIC_FIREBASE_API_KEY=xxx
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=xxx.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=xxx
+NEXT_PUBLIC_API_URL=http://localhost:8080
+```
+
+**Mobile** (`apps/mobile/.env`):
+```
+EXPO_PUBLIC_FIREBASE_API_KEY=xxx
+EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN=xxx.firebaseapp.com
+EXPO_PUBLIC_FIREBASE_PROJECT_ID=xxx
+EXPO_PUBLIC_API_URL=http://localhost:8080
+```
 
 ### 4. Run Locally
 ```bash
-# API
-npm run dev:api
+# Install deps
+npm install
 
-# Web
-npm run dev:web
+# API (terminal 1)
+cd apps/api && npm install && npm run dev
 
-# Mobile
+# Web (terminal 2)
+cd apps/web && npm install && npm run dev
+
+# Mobile (terminal 3)
 cd apps/mobile && npx expo start
 ```
 
-## Deployment
+## Deploy
 
 ### API → Cloud Run
 ```bash
+cd apps/api
 gcloud run deploy car-tracker-api \
-  --source apps/api \
+  --source . \
   --region us-central1 \
-  --allow-unauthenticated
+  --allow-unauthenticated \
+  --set-env-vars FIREBASE_PROJECT_ID=your-project-id
 ```
 
 ### Web → Firebase Hosting
@@ -75,6 +96,23 @@ cd apps/web
 npm run build
 firebase deploy --only hosting
 ```
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/users/me` | Get current user |
+| GET | `/api/cars` | List all cars |
+| POST | `/api/cars` | Create car |
+| GET | `/api/cars/:id` | Get car with stats |
+| PATCH | `/api/cars/:id` | Update car |
+| DELETE | `/api/cars/:id` | Delete car |
+| GET | `/api/services` | List services |
+| POST | `/api/services` | Create service |
+| DELETE | `/api/services/:id` | Delete service |
+| GET | `/api/services/spending` | Spending summary |
+| GET | `/api/valuations/cars/:id` | Get valuation |
+| POST | `/api/valuations/sales` | Add comparable sale |
 
 ## Features
 
@@ -85,3 +123,4 @@ firebase deploy --only hosting
 - 💰 Valuation tracking (BaT, Cars & Bids)
 - 📱 Mobile + Web apps
 - ☁️ Cross-device sync
+- 🔐 Firebase Auth

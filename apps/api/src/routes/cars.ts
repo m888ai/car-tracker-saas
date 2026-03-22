@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { prisma } from '@car-tracker/database';
+import { carsRef, servicesRef, db } from '../lib/firebase';
 import { AuthRequest } from '../middleware/auth';
 import { z } from 'zod';
 
@@ -8,23 +8,14 @@ export const carsRouter = Router();
 // Get all cars for user
 carsRouter.get('/', async (req: AuthRequest, res) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
+    const snapshot = await carsRef(req.user!.uid)
+      .orderBy('createdAt', 'desc')
+      .get();
 
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    const cars = await prisma.car.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        _count: {
-          select: { serviceRecords: true },
-        },
-      },
-    });
+    const cars = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
 
     res.json(cars);
   } catch (error) {
@@ -33,32 +24,32 @@ carsRouter.get('/', async (req: AuthRequest, res) => {
   }
 });
 
-// Get single car
+// Get single car with stats
 carsRouter.get('/:id', async (req: AuthRequest, res) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
+    const carDoc = await carsRef(req.user!.uid).doc(req.params.id).get();
 
-    const car = await prisma.car.findFirst({
-      where: { id: req.params.id, userId: user!.id },
-      include: {
-        serviceRecords: {
-          orderBy: { date: 'desc' },
-          take: 10,
-        },
-        valuations: {
-          orderBy: { calculatedAt: 'desc' },
-          take: 1,
-        },
-      },
-    });
-
-    if (!car) {
+    if (!carDoc.exists) {
       return res.status(404).json({ error: 'Car not found' });
     }
 
-    res.json(car);
+    // Get service count and total spent
+    const servicesSnap = await servicesRef(req.user!.uid)
+      .where('carId', '==', req.params.id)
+      .get();
+
+    const services = servicesSnap.docs.map(d => d.data());
+    const totalSpent = services.reduce((sum, s) => sum + (s.cost || 0), 0);
+
+    res.json({
+      id: carDoc.id,
+      ...carDoc.data(),
+      stats: {
+        serviceCount: services.length,
+        totalSpent,
+        avgCostPerService: services.length > 0 ? totalSpent / services.length : 0,
+      },
+    });
   } catch (error) {
     console.error('Error fetching car:', error);
     res.status(500).json({ error: 'Failed to fetch car' });
@@ -84,29 +75,16 @@ carsRouter.post('/', async (req: AuthRequest, res) => {
   try {
     const data = createCarSchema.parse(req.body);
 
-    let user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
+    const carRef = carsRef(req.user!.uid).doc();
+    const car = {
+      ...data,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
 
-    // Create user if doesn't exist
-    if (!user) {
-      user = await prisma.user.create({
-        data: {
-          firebaseUid: req.user!.uid,
-          email: req.user!.email || '',
-        },
-      });
-    }
+    await carRef.set(car);
 
-    const car = await prisma.car.create({
-      data: {
-        ...data,
-        userId: user.id,
-        purchaseDate: data.purchaseDate ? new Date(data.purchaseDate) : undefined,
-      },
-    });
-
-    res.status(201).json(car);
+    res.status(201).json({ id: carRef.id, ...car });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors });
@@ -120,25 +98,21 @@ carsRouter.post('/', async (req: AuthRequest, res) => {
 carsRouter.patch('/:id', async (req: AuthRequest, res) => {
   try {
     const data = createCarSchema.partial().parse(req.body);
+    const carRef = carsRef(req.user!.uid).doc(req.params.id);
 
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
-
-    const car = await prisma.car.updateMany({
-      where: { id: req.params.id, userId: user!.id },
-      data: {
-        ...data,
-        purchaseDate: data.purchaseDate ? new Date(data.purchaseDate) : undefined,
-      },
-    });
-
-    if (car.count === 0) {
+    const carDoc = await carRef.get();
+    if (!carDoc.exists) {
       return res.status(404).json({ error: 'Car not found' });
     }
 
-    const updated = await prisma.car.findUnique({ where: { id: req.params.id } });
-    res.json(updated);
+    const updates = {
+      ...data,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await carRef.update(updates);
+
+    res.json({ id: req.params.id, ...carDoc.data(), ...updates });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors });
@@ -151,17 +125,22 @@ carsRouter.patch('/:id', async (req: AuthRequest, res) => {
 // Delete car
 carsRouter.delete('/:id', async (req: AuthRequest, res) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
+    const carRef = carsRef(req.user!.uid).doc(req.params.id);
 
-    const result = await prisma.car.deleteMany({
-      where: { id: req.params.id, userId: user!.id },
-    });
-
-    if (result.count === 0) {
+    const carDoc = await carRef.get();
+    if (!carDoc.exists) {
       return res.status(404).json({ error: 'Car not found' });
     }
+
+    // Delete all services for this car
+    const servicesSnap = await servicesRef(req.user!.uid)
+      .where('carId', '==', req.params.id)
+      .get();
+
+    const batch = db.batch();
+    servicesSnap.docs.forEach(doc => batch.delete(doc.ref));
+    batch.delete(carRef);
+    await batch.commit();
 
     res.json({ success: true });
   } catch (error) {
@@ -173,31 +152,24 @@ carsRouter.delete('/:id', async (req: AuthRequest, res) => {
 // Get car stats
 carsRouter.get('/:id/stats', async (req: AuthRequest, res) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
+    const carDoc = await carsRef(req.user!.uid).doc(req.params.id).get();
 
-    const car = await prisma.car.findFirst({
-      where: { id: req.params.id, userId: user!.id },
-    });
-
-    if (!car) {
+    if (!carDoc.exists) {
       return res.status(404).json({ error: 'Car not found' });
     }
 
-    const services = await prisma.serviceRecord.findMany({
-      where: { carId: car.id },
-    });
+    const servicesSnap = await servicesRef(req.user!.uid)
+      .where('carId', '==', req.params.id)
+      .get();
 
-    const totalSpent = services.reduce((sum, s) => sum + Number(s.cost), 0);
-    const serviceCount = services.length;
-    const avgCost = serviceCount > 0 ? totalSpent / serviceCount : 0;
+    const services = servicesSnap.docs.map(d => d.data());
+    const totalSpent = services.reduce((sum, s) => sum + (s.cost || 0), 0);
 
     res.json({
       totalSpent,
-      serviceCount,
-      avgCostPerService: avgCost,
-      currentMileage: car.currentMileage,
+      serviceCount: services.length,
+      avgCostPerService: services.length > 0 ? totalSpent / services.length : 0,
+      currentMileage: carDoc.data()?.currentMileage,
     });
   } catch (error) {
     console.error('Error fetching stats:', error);

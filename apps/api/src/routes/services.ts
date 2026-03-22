@@ -1,35 +1,42 @@
 import { Router } from 'express';
-import { prisma, ServiceType } from '@car-tracker/database';
+import { servicesRef, carsRef } from '../lib/firebase';
 import { AuthRequest } from '../middleware/auth';
 import { z } from 'zod';
 
 export const servicesRouter = Router();
 
-// Get all services for user
+const SERVICE_TYPES = [
+  'OIL_CHANGE', 'TIRES', 'BRAKES', 'BATTERY', 'TRANSMISSION',
+  'INSPECTION', 'REGISTRATION', 'INSURANCE', 'WASH_DETAIL',
+  'REPAIR', 'MAINTENANCE', 'UPGRADE', 'FUEL', 'OTHER'
+] as const;
+
+// Get all services
 servicesRouter.get('/', async (req: AuthRequest, res) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
-
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
     const carId = req.query.carId as string | undefined;
 
-    const services = await prisma.serviceRecord.findMany({
-      where: {
-        userId: user.id,
-        ...(carId && { carId }),
-      },
-      orderBy: { date: 'desc' },
-      include: {
-        car: {
-          select: { make: true, model: true, year: true, nickname: true },
-        },
-      },
-    });
+    let query = servicesRef(req.user!.uid).orderBy('date', 'desc');
+    
+    const snapshot = await query.get();
+    let services = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    // Filter by carId if provided (Firestore compound query limitation)
+    if (carId) {
+      services = services.filter(s => (s as any).carId === carId);
+    }
+
+    // Get car info for each service
+    const carsSnap = await carsRef(req.user!.uid).get();
+    const carsMap = new Map(carsSnap.docs.map(d => [d.id, d.data()]));
+
+    services = services.map(s => ({
+      ...s,
+      car: carsMap.get((s as any).carId),
+    }));
 
     res.json(services);
   } catch (error) {
@@ -38,11 +45,11 @@ servicesRouter.get('/', async (req: AuthRequest, res) => {
   }
 });
 
-// Create service record
+// Create service
 const createServiceSchema = z.object({
   carId: z.string(),
   date: z.string(),
-  type: z.nativeEnum(ServiceType),
+  type: z.enum(SERVICE_TYPES),
   customType: z.string().optional(),
   description: z.string().min(1),
   mileage: z.number().int().optional(),
@@ -60,41 +67,29 @@ servicesRouter.post('/', async (req: AuthRequest, res) => {
   try {
     const data = createServiceSchema.parse(req.body);
 
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
-
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // Verify car belongs to user
-    const car = await prisma.car.findFirst({
-      where: { id: data.carId, userId: user.id },
-    });
-
-    if (!car) {
+    // Verify car exists
+    const carDoc = await carsRef(req.user!.uid).doc(data.carId).get();
+    if (!carDoc.exists) {
       return res.status(404).json({ error: 'Car not found' });
     }
 
-    const service = await prisma.serviceRecord.create({
-      data: {
-        ...data,
-        userId: user.id,
-        date: new Date(data.date),
-        reminderDate: data.reminderDate ? new Date(data.reminderDate) : undefined,
-      },
-    });
+    const serviceRef = servicesRef(req.user!.uid).doc();
+    const service = {
+      ...data,
+      createdAt: new Date().toISOString(),
+    };
+
+    await serviceRef.set(service);
 
     // Update car mileage if provided
     if (data.mileage) {
-      await prisma.car.update({
-        where: { id: data.carId },
-        data: { currentMileage: data.mileage },
+      await carsRef(req.user!.uid).doc(data.carId).update({
+        currentMileage: data.mileage,
+        updatedAt: new Date().toISOString(),
       });
     }
 
-    res.status(201).json(service);
+    res.status(201).json({ id: serviceRef.id, ...service });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors });
@@ -107,17 +102,14 @@ servicesRouter.post('/', async (req: AuthRequest, res) => {
 // Delete service
 servicesRouter.delete('/:id', async (req: AuthRequest, res) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
+    const serviceRef = servicesRef(req.user!.uid).doc(req.params.id);
 
-    const result = await prisma.serviceRecord.deleteMany({
-      where: { id: req.params.id, userId: user!.id },
-    });
-
-    if (result.count === 0) {
+    const serviceDoc = await serviceRef.get();
+    if (!serviceDoc.exists) {
       return res.status(404).json({ error: 'Service not found' });
     }
+
+    await serviceRef.delete();
 
     res.json({ success: true });
   } catch (error) {
@@ -129,64 +121,60 @@ servicesRouter.delete('/:id', async (req: AuthRequest, res) => {
 // Get spending summary
 servicesRouter.get('/spending', async (req: AuthRequest, res) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { firebaseUid: req.user!.uid },
-    });
-
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
     const year = parseInt(req.query.year as string) || new Date().getFullYear();
-    const startOfYear = new Date(year, 0, 1);
-    const endOfYear = new Date(year, 11, 31);
 
-    const services = await prisma.serviceRecord.findMany({
-      where: {
-        userId: user.id,
-        date: { gte: startOfYear, lte: endOfYear },
-      },
-      include: {
-        car: { select: { make: true, model: true, year: true } },
-      },
+    const snapshot = await servicesRef(req.user!.uid).get();
+    const allServices = snapshot.docs.map(doc => doc.data());
+
+    // Filter by year
+    const services = allServices.filter(s => {
+      const serviceYear = new Date(s.date).getFullYear();
+      return serviceYear === year;
     });
 
-    const total = services.reduce((sum, s) => sum + Number(s.cost), 0);
+    const total = services.reduce((sum, s) => sum + (s.cost || 0), 0);
 
     // By category
     const byCategory: Record<string, number> = {};
-    services.forEach((s) => {
-      byCategory[s.type] = (byCategory[s.type] || 0) + Number(s.cost);
+    services.forEach(s => {
+      byCategory[s.type] = (byCategory[s.type] || 0) + (s.cost || 0);
     });
 
     // By car
-    const byCar: Record<string, { name: string; total: number }> = {};
-    services.forEach((s) => {
-      const carName = `${s.car.year} ${s.car.make} ${s.car.model}`;
-      if (!byCar[s.carId]) {
-        byCar[s.carId] = { name: carName, total: 0 };
-      }
-      byCar[s.carId].total += Number(s.cost);
+    const carsSnap = await carsRef(req.user!.uid).get();
+    const carsMap = new Map(carsSnap.docs.map(d => [d.id, d.data()]));
+
+    const byCarMap: Record<string, number> = {};
+    services.forEach(s => {
+      byCarMap[s.carId] = (byCarMap[s.carId] || 0) + (s.cost || 0);
+    });
+
+    const byCar = Object.entries(byCarMap).map(([carId, total]) => {
+      const car = carsMap.get(carId);
+      return {
+        carId,
+        name: car ? `${car.year} ${car.make} ${car.model}` : 'Unknown',
+        total,
+      };
     });
 
     // By month
-    const byMonth: Record<string, number> = {};
-    services.forEach((s) => {
-      const month = s.date.toISOString().slice(0, 7);
-      byMonth[month] = (byMonth[month] || 0) + Number(s.cost);
+    const byMonthMap: Record<string, number> = {};
+    services.forEach(s => {
+      const month = s.date.slice(0, 7);
+      byMonthMap[month] = (byMonthMap[month] || 0) + (s.cost || 0);
     });
+
+    const byMonth = Object.entries(byMonthMap)
+      .map(([month, total]) => ({ month, total }))
+      .sort((a, b) => a.month.localeCompare(b.month));
 
     res.json({
       year,
       total,
       byCategory,
-      byCar: Object.entries(byCar).map(([carId, data]) => ({
-        carId,
-        ...data,
-      })),
-      byMonth: Object.entries(byMonth)
-        .map(([month, total]) => ({ month, total }))
-        .sort((a, b) => a.month.localeCompare(b.month)),
+      byCar,
+      byMonth,
     });
   } catch (error) {
     console.error('Error fetching spending:', error);
