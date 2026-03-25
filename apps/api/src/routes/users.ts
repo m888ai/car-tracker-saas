@@ -1,41 +1,24 @@
 import { Router } from 'express';
-import { userRef, carsRef, servicesRef, db } from '../lib/firebase';
+import { prisma } from '../lib/db';
 import { AuthRequest } from '../middleware/auth';
+import { getOrCreateUser } from '../lib/getUser';
 import { z } from 'zod';
 
 export const usersRouter = Router();
 
-// Get current user
+// Get or create user profile
 usersRouter.get('/me', async (req: AuthRequest, res) => {
   try {
-    const docRef = userRef(req.user!.uid);
-    let userDoc = await docRef.get();
+    const user = await getOrCreateUser(req.user!);
 
-    // Create user if doesn't exist
-    if (!userDoc.exists) {
-      const userData = {
-        email: req.user!.email || '',
-        plan: 'FREE',
-        createdAt: new Date().toISOString(),
-      };
-      await docRef.set(userData);
-      userDoc = await docRef.get();
-    }
-
-    // Get counts
-    const [carsSnap, servicesSnap] = await Promise.all([
-      carsRef(req.user!.uid).get(),
-      servicesRef(req.user!.uid).get(),
-    ]);
-
-    res.json({
-      id: userDoc.id,
-      ...userDoc.data(),
-      _count: {
-        cars: carsSnap.size,
-        services: servicesSnap.size,
+    const userWithCount = await prisma.user.findUnique({
+      where: { id: user.id },
+      include: {
+        _count: { select: { cars: true } },
       },
     });
+
+    res.json(userWithCount);
   } catch (error) {
     console.error('Error fetching user:', error);
     res.status(500).json({ error: 'Failed to fetch user' });
@@ -45,21 +28,20 @@ usersRouter.get('/me', async (req: AuthRequest, res) => {
 // Update user profile
 const updateUserSchema = z.object({
   name: z.string().optional(),
-  avatarUrl: z.string().optional(),
+  avatarUrl: z.string().url().optional(),
 });
 
 usersRouter.patch('/me', async (req: AuthRequest, res) => {
   try {
     const data = updateUserSchema.parse(req.body);
-    const docRef = userRef(req.user!.uid);
+    const existingUser = await getOrCreateUser(req.user!);
 
-    await docRef.update({
-      ...data,
-      updatedAt: new Date().toISOString(),
+    const user = await prisma.user.update({
+      where: { id: existingUser.id },
+      data,
     });
 
-    const userDoc = await docRef.get();
-    res.json({ id: userDoc.id, ...userDoc.data() });
+    res.json(user);
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors });
@@ -69,24 +51,58 @@ usersRouter.patch('/me', async (req: AuthRequest, res) => {
   }
 });
 
-// Delete user account
+// Get user dashboard stats
+usersRouter.get('/me/stats', async (req: AuthRequest, res) => {
+  try {
+    const user = await getOrCreateUser(req.user!);
+
+    const cars = await prisma.car.findMany({
+      where: { userId: user.id },
+      include: {
+        serviceRecords: true,
+        valuations: { orderBy: { createdAt: 'desc' }, take: 1 },
+      },
+    });
+
+    const totalCars = cars.length;
+    const totalServices = cars.reduce((sum, c) => sum + c.serviceRecords.length, 0);
+    const totalSpent = cars.reduce(
+      (sum, c) => sum + c.serviceRecords.reduce((s, r) => s + r.cost, 0),
+      0
+    );
+    const totalValue = cars.reduce((sum, c) => {
+      const val = c.valuations[0];
+      return sum + (val ? val.midEstimate : 0);
+    }, 0);
+
+    // Recent services
+    const recentServices = await prisma.serviceRecord.findMany({
+      where: { car: { userId: user.id } },
+      orderBy: { date: 'desc' },
+      take: 5,
+      include: { car: { select: { make: true, model: true } } },
+    });
+
+    res.json({
+      totalCars,
+      totalServices,
+      totalSpent,
+      totalEstimatedValue: totalValue,
+      recentServices,
+    });
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// Delete account
 usersRouter.delete('/me', async (req: AuthRequest, res) => {
   try {
-    // Delete all user data
-    const batch = db.batch();
+    const user = await getOrCreateUser(req.user!);
 
-    // Delete services
-    const servicesSnap = await servicesRef(req.user!.uid).get();
-    servicesSnap.docs.forEach(doc => batch.delete(doc.ref));
-
-    // Delete cars
-    const carsSnap = await carsRef(req.user!.uid).get();
-    carsSnap.docs.forEach(doc => batch.delete(doc.ref));
-
-    // Delete user
-    batch.delete(userRef(req.user!.uid));
-
-    await batch.commit();
+    // Cascade delete handles cars, services, valuations, sales
+    await prisma.user.delete({ where: { id: user.id } });
 
     res.json({ success: true });
   } catch (error) {

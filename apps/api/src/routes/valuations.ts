@@ -1,150 +1,192 @@
 import { Router } from 'express';
-import { salesRef, carsRef, db } from '../lib/firebase';
+import { prisma } from '../lib/db';
 import { AuthRequest } from '../middleware/auth';
+import { getOrCreateUser } from '../lib/getUser';
 import { z } from 'zod';
 
 export const valuationsRouter = Router();
 
-// Get comparable sales for a car
-valuationsRouter.get('/cars/:carId/sales', async (req: AuthRequest, res) => {
+// Get valuation for a car
+valuationsRouter.get('/car/:carId', async (req: AuthRequest, res) => {
   try {
-    const snapshot = await salesRef(req.user!.uid)
-      .where('carId', '==', req.params.carId)
-      .orderBy('saleDate', 'desc')
-      .get();
+    const user = await getOrCreateUser(req.user!);
 
-    const sales = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
+    const car = await prisma.car.findFirst({
+      where: { id: req.params.carId, userId: user.id },
+    });
 
-    res.json(sales);
+    if (!car) {
+      return res.status(404).json({ error: 'Car not found' });
+    }
+
+    const valuation = await prisma.valuation.findFirst({
+      where: { carId: req.params.carId },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const sales = await prisma.comparableSale.findMany({
+      where: { carId: req.params.carId },
+      orderBy: { saleDate: 'desc' },
+    });
+
+    res.json({ valuation, comparableSales: sales });
   } catch (error) {
-    console.error('Error fetching sales:', error);
-    res.status(500).json({ error: 'Failed to fetch sales' });
+    console.error('Error fetching valuation:', error);
+    res.status(500).json({ error: 'Failed to fetch valuation' });
   }
 });
 
 // Add comparable sale
-const createSaleSchema = z.object({
-  carId: z.string(),
-  source: z.string(),
-  sourceName: z.string(),
-  sourceUrl: z.string().optional(),
-  make: z.string(),
-  model: z.string(),
-  year: z.number().int(),
-  price: z.number(),
+const addSaleSchema = z.object({
+  carId: z.string().uuid(),
+  source: z.string().min(1),
+  sourceUrl: z.string().url().optional(),
+  salePrice: z.number().positive(),
   saleDate: z.string(),
-  mileage: z.number().int().optional(),
   condition: z.string().optional(),
-  transmission: z.string().optional(),
+  mileage: z.number().int().optional(),
   description: z.string().optional(),
-  imageUrl: z.string().optional(),
-  location: z.string().optional(),
 });
 
 valuationsRouter.post('/sales', async (req: AuthRequest, res) => {
   try {
-    const data = createSaleSchema.parse(req.body);
+    const data = addSaleSchema.parse(req.body);
+    const user = await getOrCreateUser(req.user!);
 
-    // Verify car exists
-    const carDoc = await carsRef(req.user!.uid).doc(data.carId).get();
-    if (!carDoc.exists) {
+    const car = await prisma.car.findFirst({
+      where: { id: data.carId, userId: user.id },
+    });
+
+    if (!car) {
       return res.status(404).json({ error: 'Car not found' });
     }
 
-    const saleRef = salesRef(req.user!.uid).doc();
-    const sale = {
-      ...data,
-      createdAt: new Date().toISOString(),
-    };
+    const sale = await prisma.comparableSale.create({
+      data: {
+        ...data,
+        saleDate: new Date(data.saleDate),
+      },
+    });
 
-    await saleRef.set(sale);
+    // Recalculate valuation
+    const valuation = await recalculateValuation(data.carId, user.id);
 
-    res.status(201).json({ id: saleRef.id, ...sale });
+    res.status(201).json({ sale, valuation });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors });
     }
-    console.error('Error creating sale:', error);
-    res.status(500).json({ error: 'Failed to create sale' });
+    console.error('Error adding sale:', error);
+    res.status(500).json({ error: 'Failed to add sale' });
   }
 });
 
 // Delete comparable sale
 valuationsRouter.delete('/sales/:id', async (req: AuthRequest, res) => {
   try {
-    const saleRef = salesRef(req.user!.uid).doc(req.params.id);
+    const user = await getOrCreateUser(req.user!);
 
-    const saleDoc = await saleRef.get();
-    if (!saleDoc.exists) {
+    const sale = await prisma.comparableSale.findFirst({
+      where: {
+        id: req.params.id,
+        car: { userId: user.id },
+      },
+    });
+
+    if (!sale) {
       return res.status(404).json({ error: 'Sale not found' });
     }
 
-    await saleRef.delete();
+    const carId = sale.carId;
+    await prisma.comparableSale.delete({ where: { id: req.params.id } });
 
-    res.json({ success: true });
+    // Recalculate valuation
+    const valuation = await recalculateValuation(carId, user.id);
+
+    res.json({ success: true, valuation });
   } catch (error) {
     console.error('Error deleting sale:', error);
     res.status(500).json({ error: 'Failed to delete sale' });
   }
 });
 
-// Get valuation for a car
-valuationsRouter.get('/cars/:carId', async (req: AuthRequest, res) => {
+// Recalculate valuation
+valuationsRouter.post('/recalculate/:carId', async (req: AuthRequest, res) => {
   try {
-    const carDoc = await carsRef(req.user!.uid).doc(req.params.carId).get();
+    const user = await getOrCreateUser(req.user!);
 
-    if (!carDoc.exists) {
+    const car = await prisma.car.findFirst({
+      where: { id: req.params.carId, userId: user.id },
+    });
+
+    if (!car) {
       return res.status(404).json({ error: 'Car not found' });
     }
 
-    // Get comparable sales
-    const salesSnap = await salesRef(req.user!.uid)
-      .where('carId', '==', req.params.carId)
-      .get();
+    const valuation = await recalculateValuation(req.params.carId, user.id);
 
-    const sales = salesSnap.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
-    // Calculate estimate
-    let estimate = null;
-    if (sales.length > 0) {
-      const prices = sales.map(s => (s as any).price).sort((a: number, b: number) => a - b);
-      const sum = prices.reduce((a: number, b: number) => a + b, 0);
-      const avg = sum / prices.length;
-
-      // Standard deviation
-      const variance = prices.reduce((acc: number, p: number) => acc + Math.pow(p - avg, 2), 0) / prices.length;
-      const stdDev = Math.sqrt(variance);
-
-      // Confidence
-      let confidence = 'low';
-      if (sales.length >= 10 && stdDev / avg < 0.3) {
-        confidence = 'high';
-      } else if (sales.length >= 5 && stdDev / avg < 0.5) {
-        confidence = 'medium';
-      }
-
-      estimate = {
-        low: Math.round(avg - stdDev),
-        mid: Math.round(avg),
-        high: Math.round(avg + stdDev),
-        confidence,
-        basedOn: sales.length,
-      };
-    }
-
-    res.json({
-      car: { id: carDoc.id, ...carDoc.data() },
-      estimate,
-      comparableSales: sales,
-    });
+    res.json(valuation);
   } catch (error) {
-    console.error('Error fetching valuation:', error);
-    res.status(500).json({ error: 'Failed to fetch valuation' });
+    console.error('Error recalculating valuation:', error);
+    res.status(500).json({ error: 'Failed to recalculate valuation' });
   }
 });
+
+// Helper function to recalculate valuation
+async function recalculateValuation(carId: string, userId: string) {
+  const sales = await prisma.comparableSale.findMany({
+    where: { carId },
+    orderBy: { saleDate: 'desc' },
+  });
+
+  if (sales.length === 0) {
+    // Delete existing valuation if no sales
+    await prisma.valuation.deleteMany({ where: { carId } });
+    return null;
+  }
+
+  const prices = sales.map((s) => s.salePrice);
+  const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+  const sorted = [...prices].sort((a, b) => a - b);
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+
+  // Confidence based on sample size (max 1.0 at 10+ sales)
+  const confidence = Math.min(sales.length / 10, 1);
+
+  // Calculate estimates
+  const lowEstimate = min * 0.95;
+  const highEstimate = max * 1.05;
+  const midEstimate = avg;
+
+  // Upsert valuation
+  const existingValuation = await prisma.valuation.findFirst({
+    where: { carId },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  if (existingValuation) {
+    return prisma.valuation.update({
+      where: { id: existingValuation.id },
+      data: {
+        lowEstimate,
+        midEstimate,
+        highEstimate,
+        confidence,
+        salesCount: sales.length,
+      },
+    });
+  } else {
+    return prisma.valuation.create({
+      data: {
+        carId,
+        userId,
+        lowEstimate,
+        midEstimate,
+        highEstimate,
+        confidence,
+        salesCount: sales.length,
+      },
+    });
+  }
+}

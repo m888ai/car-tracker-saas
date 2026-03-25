@@ -1,13 +1,13 @@
 import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
 import './globals.css';
-import { Providers } from './providers';
+import Providers from '@/components/Providers';
 
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
   title: 'Car Tracker',
-  description: 'Track car services, maintenance, and value across all your vehicles',
+  description: 'Track your vehicles, services, and spending',
 };
 
 export default function RootLayout({

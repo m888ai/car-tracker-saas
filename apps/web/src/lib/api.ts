@@ -1,53 +1,104 @@
+import axios from 'axios';
 import { auth } from './firebase';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
+const api = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL,
+});
 
-async function getAuthToken(): Promise<string | null> {
+api.interceptors.request.use(async (config) => {
   const user = auth.currentUser;
-  if (!user) return null;
-  return user.getIdToken();
-}
-
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = await getAuthToken();
-
-  const response = await fetch(`${API_URL}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token && { Authorization: `Bearer ${token}` }),
-      ...options.headers,
-    },
-  });
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Request failed' }));
-    throw new Error(error.error || 'Request failed');
+  if (user) {
+    const token = await user.getIdToken();
+    config.headers.Authorization = `Bearer ${token}`;
   }
+  return config;
+});
 
-  return response.json();
+// Types
+export interface Car {
+  id: string;
+  make: string;
+  model: string;
+  year: number;
+  type?: string;
+  vin?: string;
+  licensePlate?: string;
+  color?: string;
+  mileage: number;
+  photoUrl?: string;
+  notes?: string;
+  purchaseDate?: string;
+  purchasePrice?: number;
+  createdAt: string;
+  stats?: {
+    serviceCount: number;
+    totalSpent: number;
+    avgCostPerService: number;
+  };
 }
 
-export const api = {
-  // Users
-  getMe: () => request('/api/users/me'),
+export interface ServiceRecord {
+  id: string;
+  carId: string;
+  category: string;
+  description?: string;
+  cost: number;
+  mileage?: number;
+  date: string;
+  location?: string;
+  receiptUrl?: string;
+  notes?: string;
+  car?: { make: string; model: string };
+}
 
-  // Cars
-  getCars: () => request('/api/cars'),
-  getCar: (id: string) => request(`/api/cars/${id}`),
-  createCar: (data: any) => request('/api/cars', { method: 'POST', body: JSON.stringify(data) }),
-  updateCar: (id: string, data: any) => request(`/api/cars/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-  deleteCar: (id: string) => request(`/api/cars/${id}`, { method: 'DELETE' }),
-  getCarStats: (id: string) => request(`/api/cars/${id}/stats`),
+export interface Valuation {
+  id: string;
+  carId: string;
+  lowEstimate: number;
+  midEstimate: number;
+  highEstimate: number;
+  confidence: number;
+  salesCount: number;
+}
 
-  // Services
-  getServices: (carId?: string) => request(`/api/services${carId ? `?carId=${carId}` : ''}`),
-  createService: (data: any) => request('/api/services', { method: 'POST', body: JSON.stringify(data) }),
-  deleteService: (id: string) => request(`/api/services/${id}`, { method: 'DELETE' }),
-  getSpending: (year?: number) => request(`/api/services/spending${year ? `?year=${year}` : ''}`),
+export interface DashboardStats {
+  totalCars: number;
+  totalServices: number;
+  totalSpent: number;
+  totalEstimatedValue: number;
+  recentServices: ServiceRecord[];
+}
 
-  // Valuations
-  getValuation: (carId: string) => request(`/api/valuations/cars/${carId}`),
-  addComparableSale: (data: any) => request('/api/valuations/sales', { method: 'POST', body: JSON.stringify(data) }),
-  deleteComparableSale: (id: string) => request(`/api/valuations/sales/${id}`, { method: 'DELETE' }),
+// API calls
+export const carsApi = {
+  list: () => api.get<Car[]>('/api/cars').then((r) => r.data),
+  get: (id: string) => api.get<Car>(`/api/cars/${id}`).then((r) => r.data),
+  create: (data: Partial<Car>) => api.post<Car>('/api/cars', data).then((r) => r.data),
+  update: (id: string, data: Partial<Car>) => api.patch<Car>(`/api/cars/${id}`, data).then((r) => r.data),
+  delete: (id: string) => api.delete(`/api/cars/${id}`),
+  stats: (id: string) => api.get(`/api/cars/${id}/stats`).then((r) => r.data),
 };
+
+export const servicesApi = {
+  list: (carId?: string) => api.get<ServiceRecord[]>('/api/services', { params: { carId } }).then((r) => r.data),
+  get: (id: string) => api.get<ServiceRecord>(`/api/services/${id}`).then((r) => r.data),
+  create: (data: Partial<ServiceRecord>) => api.post<ServiceRecord>('/api/services', data).then((r) => r.data),
+  update: (id: string, data: Partial<ServiceRecord>) => api.patch<ServiceRecord>(`/api/services/${id}`, data).then((r) => r.data),
+  delete: (id: string) => api.delete(`/api/services/${id}`),
+  analytics: (year?: number, carId?: string) => api.get('/api/services/analytics/spending', { params: { year, carId } }).then((r) => r.data),
+};
+
+export const valuationsApi = {
+  get: (carId: string) => api.get(`/api/valuations/car/${carId}`).then((r) => r.data),
+  addSale: (data: any) => api.post('/api/valuations/sales', data).then((r) => r.data),
+  deleteSale: (id: string) => api.delete(`/api/valuations/sales/${id}`).then((r) => r.data),
+  recalculate: (carId: string) => api.post(`/api/valuations/recalculate/${carId}`).then((r) => r.data),
+};
+
+export const usersApi = {
+  me: () => api.get('/api/users/me').then((r) => r.data),
+  update: (data: any) => api.patch('/api/users/me', data).then((r) => r.data),
+  stats: () => api.get<DashboardStats>('/api/users/me/stats').then((r) => r.data),
+};
+
+export default api;

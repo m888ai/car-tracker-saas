@@ -1,42 +1,27 @@
 import { Router } from 'express';
-import { servicesRef, carsRef } from '../lib/firebase';
+import { prisma } from '../lib/db';
 import { AuthRequest } from '../middleware/auth';
+import { getOrCreateUser } from '../lib/getUser';
 import { z } from 'zod';
 
 export const servicesRouter = Router();
 
-const SERVICE_TYPES = [
-  'OIL_CHANGE', 'TIRES', 'BRAKES', 'BATTERY', 'TRANSMISSION',
-  'INSPECTION', 'REGISTRATION', 'INSURANCE', 'WASH_DETAIL',
-  'REPAIR', 'MAINTENANCE', 'UPGRADE', 'FUEL', 'OTHER'
-] as const;
-
-// Get all services
+// Get all services for user (optionally filtered by car)
 servicesRouter.get('/', async (req: AuthRequest, res) => {
   try {
+    const user = await getOrCreateUser(req.user!);
     const carId = req.query.carId as string | undefined;
 
-    let query = servicesRef(req.user!.uid).orderBy('date', 'desc');
-    
-    const snapshot = await query.get();
-    let services = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
-    // Filter by carId if provided (Firestore compound query limitation)
-    if (carId) {
-      services = services.filter(s => (s as any).carId === carId);
-    }
-
-    // Get car info for each service
-    const carsSnap = await carsRef(req.user!.uid).get();
-    const carsMap = new Map(carsSnap.docs.map(d => [d.id, d.data()]));
-
-    services = services.map(s => ({
-      ...s,
-      car: carsMap.get((s as any).carId),
-    }));
+    const services = await prisma.serviceRecord.findMany({
+      where: {
+        car: { userId: user.id },
+        ...(carId && { carId }),
+      },
+      orderBy: { date: 'desc' },
+      include: {
+        car: { select: { make: true, model: true, year: true } },
+      },
+    });
 
     res.json(services);
   } catch (error) {
@@ -45,51 +30,73 @@ servicesRouter.get('/', async (req: AuthRequest, res) => {
   }
 });
 
+// Get single service
+servicesRouter.get('/:id', async (req: AuthRequest, res) => {
+  try {
+    const user = await getOrCreateUser(req.user!);
+
+    const service = await prisma.serviceRecord.findFirst({
+      where: {
+        id: req.params.id,
+        car: { userId: user.id },
+      },
+      include: { car: true },
+    });
+
+    if (!service) {
+      return res.status(404).json({ error: 'Service not found' });
+    }
+
+    res.json(service);
+  } catch (error) {
+    console.error('Error fetching service:', error);
+    res.status(500).json({ error: 'Failed to fetch service' });
+  }
+});
+
 // Create service
 const createServiceSchema = z.object({
-  carId: z.string(),
-  date: z.string(),
-  type: z.enum(SERVICE_TYPES),
-  customType: z.string().optional(),
-  description: z.string().min(1),
+  carId: z.string().uuid(),
+  category: z.string().min(1),
+  description: z.string().optional(),
+  cost: z.number().min(0),
   mileage: z.number().int().optional(),
-  cost: z.number().default(0),
-  vendor: z.string().optional(),
+  date: z.string().optional(),
   location: z.string().optional(),
-  notes: z.string().optional(),
   receiptUrl: z.string().optional(),
-  photos: z.array(z.string()).optional(),
-  reminderMiles: z.number().int().optional(),
-  reminderDate: z.string().optional(),
+  notes: z.string().optional(),
 });
 
 servicesRouter.post('/', async (req: AuthRequest, res) => {
   try {
     const data = createServiceSchema.parse(req.body);
+    const user = await getOrCreateUser(req.user!);
 
-    // Verify car exists
-    const carDoc = await carsRef(req.user!.uid).doc(data.carId).get();
-    if (!carDoc.exists) {
+    // Verify car belongs to user
+    const car = await prisma.car.findFirst({
+      where: { id: data.carId, userId: user.id },
+    });
+
+    if (!car) {
       return res.status(404).json({ error: 'Car not found' });
     }
 
-    const serviceRef = servicesRef(req.user!.uid).doc();
-    const service = {
-      ...data,
-      createdAt: new Date().toISOString(),
-    };
-
-    await serviceRef.set(service);
+    const service = await prisma.serviceRecord.create({
+      data: {
+        ...data,
+        date: data.date ? new Date(data.date) : new Date(),
+      },
+    });
 
     // Update car mileage if provided
-    if (data.mileage) {
-      await carsRef(req.user!.uid).doc(data.carId).update({
-        currentMileage: data.mileage,
-        updatedAt: new Date().toISOString(),
+    if (data.mileage && data.mileage > car.mileage) {
+      await prisma.car.update({
+        where: { id: data.carId },
+        data: { mileage: data.mileage },
       });
     }
 
-    res.status(201).json({ id: serviceRef.id, ...service });
+    res.status(201).json(service);
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: error.errors });
@@ -99,17 +106,58 @@ servicesRouter.post('/', async (req: AuthRequest, res) => {
   }
 });
 
-// Delete service
-servicesRouter.delete('/:id', async (req: AuthRequest, res) => {
+// Update service
+servicesRouter.patch('/:id', async (req: AuthRequest, res) => {
   try {
-    const serviceRef = servicesRef(req.user!.uid).doc(req.params.id);
+    const data = createServiceSchema.partial().parse(req.body);
+    const user = await getOrCreateUser(req.user!);
 
-    const serviceDoc = await serviceRef.get();
-    if (!serviceDoc.exists) {
+    const existingService = await prisma.serviceRecord.findFirst({
+      where: {
+        id: req.params.id,
+        car: { userId: user.id },
+      },
+    });
+
+    if (!existingService) {
       return res.status(404).json({ error: 'Service not found' });
     }
 
-    await serviceRef.delete();
+    const service = await prisma.serviceRecord.update({
+      where: { id: req.params.id },
+      data: {
+        ...data,
+        date: data.date ? new Date(data.date) : undefined,
+      },
+    });
+
+    res.json(service);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: error.errors });
+    }
+    console.error('Error updating service:', error);
+    res.status(500).json({ error: 'Failed to update service' });
+  }
+});
+
+// Delete service
+servicesRouter.delete('/:id', async (req: AuthRequest, res) => {
+  try {
+    const user = await getOrCreateUser(req.user!);
+
+    const existingService = await prisma.serviceRecord.findFirst({
+      where: {
+        id: req.params.id,
+        car: { userId: user.id },
+      },
+    });
+
+    if (!existingService) {
+      return res.status(404).json({ error: 'Service not found' });
+    }
+
+    await prisma.serviceRecord.delete({ where: { id: req.params.id } });
 
     res.json({ success: true });
   } catch (error) {
@@ -118,66 +166,56 @@ servicesRouter.delete('/:id', async (req: AuthRequest, res) => {
   }
 });
 
-// Get spending summary
-servicesRouter.get('/spending', async (req: AuthRequest, res) => {
+// Spending analytics
+servicesRouter.get('/analytics/spending', async (req: AuthRequest, res) => {
   try {
-    const year = parseInt(req.query.year as string) || new Date().getFullYear();
+    const user = await getOrCreateUser(req.user!);
 
-    const snapshot = await servicesRef(req.user!.uid).get();
-    const allServices = snapshot.docs.map(doc => doc.data());
+    const carId = req.query.carId as string | undefined;
+    const year = req.query.year ? parseInt(req.query.year as string) : new Date().getFullYear();
 
-    // Filter by year
-    const services = allServices.filter(s => {
-      const serviceYear = new Date(s.date).getFullYear();
-      return serviceYear === year;
+    const startDate = new Date(year, 0, 1);
+    const endDate = new Date(year + 1, 0, 1);
+
+    const services = await prisma.serviceRecord.findMany({
+      where: {
+        car: { userId: user.id },
+        ...(carId && { carId }),
+        date: { gte: startDate, lt: endDate },
+      },
+      include: { car: { select: { make: true, model: true } } },
     });
 
-    const total = services.reduce((sum, s) => sum + (s.cost || 0), 0);
+    // Monthly spending
+    const monthly = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, total: 0 }));
+    services.forEach((s) => {
+      const month = new Date(s.date).getMonth();
+      monthly[month].total += s.cost;
+    });
 
     // By category
-    const byCategory: Record<string, number> = {};
-    services.forEach(s => {
-      byCategory[s.type] = (byCategory[s.type] || 0) + (s.cost || 0);
-    });
+    const byCategory = services.reduce((acc, s) => {
+      acc[s.category] = (acc[s.category] || 0) + s.cost;
+      return acc;
+    }, {} as Record<string, number>);
 
     // By car
-    const carsSnap = await carsRef(req.user!.uid).get();
-    const carsMap = new Map(carsSnap.docs.map(d => [d.id, d.data()]));
-
-    const byCarMap: Record<string, number> = {};
-    services.forEach(s => {
-      byCarMap[s.carId] = (byCarMap[s.carId] || 0) + (s.cost || 0);
-    });
-
-    const byCar = Object.entries(byCarMap).map(([carId, total]) => {
-      const car = carsMap.get(carId);
-      return {
-        carId,
-        name: car ? `${car.year} ${car.make} ${car.model}` : 'Unknown',
-        total,
-      };
-    });
-
-    // By month
-    const byMonthMap: Record<string, number> = {};
-    services.forEach(s => {
-      const month = s.date.slice(0, 7);
-      byMonthMap[month] = (byMonthMap[month] || 0) + (s.cost || 0);
-    });
-
-    const byMonth = Object.entries(byMonthMap)
-      .map(([month, total]) => ({ month, total }))
-      .sort((a, b) => a.month.localeCompare(b.month));
+    const byCar = services.reduce((acc, s) => {
+      const key = `${s.car.make} ${s.car.model}`;
+      acc[key] = (acc[key] || 0) + s.cost;
+      return acc;
+    }, {} as Record<string, number>);
 
     res.json({
       year,
-      total,
+      totalSpent: services.reduce((sum, s) => sum + s.cost, 0),
+      serviceCount: services.length,
+      monthly,
       byCategory,
       byCar,
-      byMonth,
     });
   } catch (error) {
-    console.error('Error fetching spending:', error);
-    res.status(500).json({ error: 'Failed to fetch spending' });
+    console.error('Error fetching analytics:', error);
+    res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 });

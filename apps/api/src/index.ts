@@ -16,6 +16,8 @@ app.use(cors({
   origin: process.env.ALLOWED_ORIGINS?.split(',') || [
     'http://localhost:3000',
     'http://localhost:8081',
+    'https://car-tracker-evc.web.app',
+    'https://car-tracker-evc.firebaseapp.com',
   ],
   credentials: true,
 }));

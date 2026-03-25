@@ -1,0 +1,105 @@
+// Car Tracker SaaS - Prisma Schema
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  firebaseUid String @unique @map("firebase_uid")
+  email     String   @unique
+  name      String?
+  avatarUrl String?  @map("avatar_url")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  cars       Car[]
+  valuations Valuation[]
+
+  @@map("users")
+}
+
+model Car {
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  make         String
+  model        String
+  year         Int
+  type         String?  // sedan, suv, truck, coupe, etc.
+  vin          String?
+  licensePlate String?  @map("license_plate")
+  color        String?
+  mileage      Int      @default(0)
+  photoUrl     String?  @map("photo_url")
+  notes        String?
+  purchaseDate DateTime? @map("purchase_date")
+  purchasePrice Float?   @map("purchase_price")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serviceRecords ServiceRecord[]
+  valuations     Valuation[]
+  comparableSales ComparableSale[]
+
+  @@map("cars")
+}
+
+model ServiceRecord {
+  id          String   @id @default(uuid())
+  carId       String   @map("car_id")
+  category    String   // oil_change, tires, brakes, battery, etc.
+  description String?
+  cost        Float    @default(0)
+  mileage     Int?
+  date        DateTime @default(now())
+  location    String?  // shop name
+  receiptUrl  String?  @map("receipt_url")
+  notes       String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  car Car @relation(fields: [carId], references: [id], onDelete: Cascade)
+
+  @@map("service_records")
+}
+
+model ComparableSale {
+  id          String   @id @default(uuid())
+  carId       String   @map("car_id")
+  source      String   // bring_a_trailer, cars_and_bids, hagerty, manual
+  sourceUrl   String?  @map("source_url")
+  salePrice   Float    @map("sale_price")
+  saleDate    DateTime @map("sale_date")
+  condition   String?  // excellent, good, fair, poor
+  mileage     Int?
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  car Car @relation(fields: [carId], references: [id], onDelete: Cascade)
+
+  @@map("comparable_sales")
+}
+
+model Valuation {
+  id           String   @id @default(uuid())
+  carId        String   @map("car_id")
+  userId       String   @map("user_id")
+  lowEstimate  Float    @map("low_estimate")
+  midEstimate  Float    @map("mid_estimate")
+  highEstimate Float    @map("high_estimate")
+  confidence   Float    @default(0) // 0-1 based on comparable sales count
+  salesCount   Int      @default(0) @map("sales_count")
+  notes        String?
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  car  Car  @relation(fields: [carId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("valuations")
+}
